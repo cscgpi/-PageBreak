@@ -477,8 +477,8 @@
 
 <!-- PDF.js -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-<!-- docx.js (standalone UMD build via CDN) -->
-<script src="https://unpkg.com/docx@8.5.0/build/index.js"></script>
+<!-- JSZip for building .docx (ZIP-based) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 
 <script>
 (() => {
@@ -636,76 +636,96 @@
     }
   });
 
-  // ── Build .docx ────────────────────────────────────────────────────────────
+  // ── Build .docx (raw Open XML + JSZip) ────────────────────────────────────
+  function escXml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, ''); // strip illegal XML chars
+  }
+
   async function buildDocx(chunks, originalName) {
-    const { Document, Packer, Paragraph, TextRun, HeadingLevel, PageBreak, AlignmentType } = docx;
+    const zip = new JSZip();
 
-    const children = [];
+    zip.file('[Content_Types].xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+  <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
+</Types>`);
 
+    zip.file('_rels/.rels', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>`);
+
+    zip.file('word/_rels/document.xml.rels', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>`);
+
+    zip.file('word/styles.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
+    <w:name w:val="Normal"/>
+    <w:rPr><w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading1">
+    <w:name w:val="heading 1"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:spacing w:before="480" w:after="120"/></w:pPr>
+    <w:rPr>
+      <w:b/><w:sz w:val="40"/><w:szCs w:val="40"/>
+      <w:color w:val="6C63FF"/>
+    </w:rPr>
+  </w:style>
+</w:styles>`);
+
+    let bodyXml = '';
     chunks.forEach((chunk, idx) => {
-      // Section heading
       const label = chunk.startPage === chunk.endPage
         ? `Page ${chunk.startPage}`
-        : `Pages ${chunk.startPage}–${chunk.endPage}`;
+        : `Pages ${chunk.startPage}\u2013${chunk.endPage}`;
 
-      // Page break before every chunk except the first
       if (idx > 0) {
-        children.push(new Paragraph({ children: [new PageBreak()] }));
+        bodyXml += `<w:p><w:r><w:br w:type="page"/></w:r></w:p>`;
       }
 
-      children.push(
-        new Paragraph({
-          text: label,
-          heading: HeadingLevel.HEADING_1,
-          thematicBreak: false,
-        })
-      );
+      bodyXml += `<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>${escXml(label)}</w:t></w:r></w:p>`;
 
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({
-              text: `Source: ${originalName}  |  ${label}`,
-              italics: true,
-              color: '666666',
-              size: 20,
-            })
-          ],
-          spacing: { after: 240 },
-        })
-      );
+      bodyXml += `<w:p><w:pPr><w:spacing w:after="240"/></w:pPr><w:r>
+        <w:rPr><w:i/><w:color w:val="888888"/><w:sz w:val="20"/></w:rPr>
+        <w:t>${escXml('Source: ' + originalName + '  |  ' + label)}</w:t>
+      </w:r></w:p>`;
 
-      // Body text — split into paragraphs on double newlines / long runs
       const paragraphs = chunk.text
         .split(/\n{2,}/)
         .map(p => p.replace(/\s+/g, ' ').trim())
         .filter(p => p.length > 0);
 
       if (paragraphs.length === 0) {
-        children.push(new Paragraph({
-          children: [new TextRun({ text: '[No text extracted for this page range]', italics: true, color: '999999' })]
-        }));
+        bodyXml += `<w:p><w:r><w:rPr><w:i/><w:color w:val="999999"/></w:rPr>
+          <w:t>[No text extracted for this page range]</w:t></w:r></w:p>`;
       } else {
         paragraphs.forEach(para => {
-          children.push(new Paragraph({
-            children: [new TextRun({ text: para })],
-            spacing: { after: 160 },
-          }));
+          bodyXml += `<w:p><w:pPr><w:spacing w:after="160"/></w:pPr>
+            <w:r><w:t xml:space="preserve">${escXml(para)}</w:t></w:r></w:p>`;
         });
       }
     });
 
-    const doc = new Document({
-      creator: 'PageBreak',
-      title: `${originalName} — chunked by PageBreak`,
-      description: `PDF split into ${chunks.length} chunks of approximately ${chunks[0] ? (chunks[0].endPage - chunks[0].startPage + 1) : '?'} pages each.`,
-      sections: [{
-        properties: {},
-        children,
-      }],
-    });
+    zip.file('word/document.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>${bodyXml}<w:sectPr/></w:body>
+</w:document>`);
 
-    return Packer.toBlob(doc);
+    return zip.generateAsync({
+      type: 'blob',
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    });
   }
 
   // ── Render results ─────────────────────────────────────────────────────────
