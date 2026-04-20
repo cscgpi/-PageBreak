@@ -565,7 +565,7 @@
 
     if (!mapped.length) return '';
 
-    // Sort top→bottom, left→right then group into lines
+    // Sort top→bottom, left→right then group into lines by y-proximity
     mapped.sort((a, b) => a.y - b.y || a.x - b.x);
     const groups = [];
     for (const item of mapped) {
@@ -578,27 +578,47 @@
       }
     }
 
-    // Build each line string using gap-aware joining
-    const rawLines = groups.map(g => {
+    // Build each line string — gap-aware, with column-separator detection
+    const lineData = groups.map(g => {
       g.items.sort((a, b) => a.x - b.x);
+
+      // Average char width for this line (used for gap thresholds)
+      const totW = g.items.reduce((s, it) => s + (it.w || 0), 0);
+      const totC = g.items.reduce((s, it) => s + Math.max(it.str.length, 1), 0);
+      const avgCW = totC > 0 ? totW / totC : (g.items[0].fontSize * 0.5);
+      const colGapThresh = avgCW * 5; // gap > 5 chars wide → column boundary
+
       let text = '';
       for (let i = 0; i < g.items.length; i++) {
-        const it   = g.items[i];
+        const it = g.items[i];
         if (i === 0) { text = it.str; continue; }
-        const prev  = g.items[i - 1];
-        const gap   = it.x - (prev.x + prev.w);
-        const charW = (prev.w > 0 && prev.str.length > 0)
-          ? prev.w / prev.str.length
-          : prev.fontSize * 0.5;
-        text += (gap < charW * 0.3) ? it.str : ' ' + it.str;
+        const prev = g.items[i - 1];
+        const gap  = it.x - (prev.x + (prev.w || 0));
+        if      (gap > colGapThresh) text += '  |  ' + it.str;  // table column
+        else if (gap < avgCW * 0.3)  text += it.str;             // broken word
+        else                          text += ' ' + it.str;
       }
-      return text.trim();
-    }).filter(Boolean);
+      return { y: g.y, text: text.trim() };
+    }).filter(d => d.text.length > 0);
 
-    // Merge hyphenated line-end breaks
+    // Detect paragraph breaks from Y-gap distribution
+    const spacings = lineData.slice(1).map((d, i) => d.y - lineData[i].y);
+    const sorted   = [...spacings].sort((a, b) => a - b);
+    const median   = sorted.length ? sorted[Math.floor(sorted.length / 2)] : 14;
+    const paraGap  = median * 1.6;
+
+    // Emit lines, inserting blank lines at paragraph breaks
+    const rawLines = [];
+    for (let i = 0; i < lineData.length; i++) {
+      if (i > 0 && lineData[i].y - lineData[i - 1].y > paraGap) rawLines.push('');
+      rawLines.push(lineData[i].text);
+    }
+
+    // Merge hyphenated line-end breaks (skip across blank lines)
     const lines = [];
     for (let i = 0; i < rawLines.length; i++) {
-      if (rawLines[i].endsWith('-') && i + 1 < rawLines.length) {
+      if (rawLines[i] === '') { lines.push(''); continue; }
+      if (rawLines[i].endsWith('-') && i + 1 < rawLines.length && rawLines[i + 1] !== '') {
         lines.push(rawLines[i].slice(0, -1) + rawLines[i + 1]);
         i++;
       } else {
@@ -611,8 +631,13 @@
   // ══════════════════════════════════════════════════════════════════════════
   // IMPROVEMENT 1 — Header / footer detection and removal
   // ══════════════════════════════════════════════════════════════════════════
+  // Normalise a header/footer candidate: collapse numbers AND roman numerals to '#'
   function normHF(s) {
-    return s.replace(/\b\d+\b/g, '#').replace(/\s+/g, ' ').trim().toLowerCase();
+    return s
+      .replace(/\b\d+\b/g, '#')
+      // roman numerals i–l (covers virtually all front-matter page numbering)
+      .replace(/\b(x{0,3}(ix|iv|v?i{0,3}))\b/gi, m => m.trim() ? '#' : m)
+      .replace(/\s+/g, ' ').trim().toLowerCase();
   }
 
   function buildHFFilter(pageTexts) {
@@ -637,18 +662,42 @@
 
     return t => {
       const lines = t.split('\n');
-      const ne = [];   // indices of non-empty lines
+      const ne = [];
       lines.forEach((l, i) => { if (l.trim()) ne.push(i); });
       if (!ne.length) return t;
 
       let s = 0, e = lines.length;
-      if (rFirst.has(normHF(lines[ne[0]])))                 s = ne[0] + 1;
-      if (rLast.has(normHF(lines[ne[ne.length - 1]])))      e = ne[ne.length - 1];
+      if (rFirst.has(normHF(lines[ne[0]])))            s = ne[0] + 1;
+      if (rLast.has(normHF(lines[ne[ne.length - 1]]))) e = ne[ne.length - 1];
 
       const result = lines.slice(s, e).join('\n');
-      // Safety: don't strip if we removed > 70 % of content
-      return result.trim().length >= t.trim().length * 0.3 ? result : t;
+      // Safety: only apply filter when ≥50 % of content survives and ≥20 chars remain
+      return (result.trim().length >= t.trim().length * 0.5 && result.trim().length >= 20)
+        ? result : t;
     };
+  }
+
+  // Strip standalone page-number lines (pure digits or roman numerals) from
+  // the very top and bottom of each page — catches what buildHFFilter misses.
+  const IS_PAGENUM = /^(\d{1,5}|[ivxlcdmIVXLCDM]{1,6})$/;
+  function stripPageNums(t) {
+    const lines = t.split('\n');
+    const ne = [];
+    lines.forEach((l, i) => { if (l.trim()) ne.push(i); });
+    if (ne.length < 2) return t;
+
+    let s = 0, e = lines.length;
+    // Strip up to 2 leading lines that are standalone page numbers
+    for (let k = 0; k < Math.min(2, ne.length - 1); k++) {
+      if (IS_PAGENUM.test(lines[ne[k]].trim())) s = ne[k] + 1; else break;
+    }
+    // Strip up to 2 trailing lines that are standalone page numbers
+    for (let k = ne.length - 1; k >= Math.max(ne.length - 2, 1); k--) {
+      if (IS_PAGENUM.test(lines[ne[k]].trim())) e = ne[k]; else break;
+    }
+
+    const result = lines.slice(s, e).join('\n');
+    return result.trim().length >= 20 ? result : t;
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -800,18 +849,32 @@
         <w:r><w:rPr><w:i/><w:color w:val="888888"/><w:sz w:val="20"/></w:rPr>
         <w:t>${escXml('Source: ' + originalName + '  |  ' + label)}</w:t></w:r></w:p>`;
 
-      const paras = chunk.text
-        .split(/\n{2,}/)
-        .map(p => p.replace(/\n/g, ' ').replace(/\s+/g, ' ').trim())
-        .filter(Boolean);
+      const blocks = chunk.text.split(/\n{2,}/).filter(b => b.trim());
 
-      if (!paras.length) {
+      if (!blocks.length) {
         body += `<w:p><w:r><w:rPr><w:i/><w:color w:val="999999"/></w:rPr>
           <w:t>[No text extracted for this page range]</w:t></w:r></w:p>`;
       } else {
-        for (const para of paras) {
-          body += `<w:p><w:pPr><w:spacing w:after="120"/></w:pPr>
-            <w:r><w:t xml:space="preserve">${escXml(para)}</w:t></w:r></w:p>`;
+        for (const block of blocks) {
+          const bLines = block.split('\n').map(l => l.trim()).filter(Boolean);
+          if (!bLines.length) continue;
+
+          // Table-like block: any line contains our column-separator marker
+          if (bLines.some(l => l.includes('  |  '))) {
+            for (const row of bLines) {
+              body += `<w:p><w:pPr><w:spacing w:after="0"/></w:pPr>
+                <w:r><w:rPr>
+                  <w:rFonts w:ascii="Courier New" w:hAnsi="Courier New" w:cs="Courier New"/>
+                  <w:sz w:val="18"/><w:szCs w:val="18"/>
+                </w:rPr><w:t xml:space="preserve">${escXml(row)}</w:t></w:r></w:p>`;
+            }
+            body += `<w:p><w:pPr><w:spacing w:after="160"/></w:pPr></w:p>`;
+          } else {
+            // Regular paragraph: join wrapped lines into one, keep as prose
+            const text = bLines.join(' ').replace(/\s+/g, ' ').trim();
+            body += `<w:p><w:pPr><w:spacing w:after="120"/></w:pPr>
+              <w:r><w:t xml:space="preserve">${escXml(text)}</w:t></w:r></w:p>`;
+          }
         }
       }
     });
@@ -860,10 +923,18 @@
       setProgress(58, 'Reconstructing lines…', '');
       const rawTexts = rawPages.map(p => reconstructPageText(p.items, p.height));
 
-      // 3. Detect & strip headers / footers, then clean
+      // 3. Detect & strip headers / footers, standalone page numbers, then clean
       setProgress(63, 'Removing headers & footers…', '');
       const hfFilter  = buildHFFilter(rawTexts);
-      const pageTexts = rawTexts.map(t => cleanText(hfFilter(t)));
+      const pageTexts = rawTexts.map((raw, i) => {
+        const filtered = stripPageNums(hfFilter(raw));
+        const cleaned  = cleanText(filtered);
+        // Fallback: if filter stripped too much, clean the raw text directly
+        if (cleaned.trim().length < 30 && raw.trim().length > 80) {
+          return cleanText(stripPageNums(raw));
+        }
+        return cleaned;
+      });
 
       // 4. Smart chunk boundaries
       setProgress(70, 'Finding natural break points…', '');
