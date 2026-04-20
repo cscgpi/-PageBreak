@@ -484,168 +484,237 @@
 (() => {
   'use strict';
 
-  // ── PDF.js worker ──────────────────────────────────────────────────────────
   pdfjsLib.GlobalWorkerOptions.workerSrc =
     'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-  // ── State ──────────────────────────────────────────────────────────────────
   let selectedFile = null;
   let generatedBlob = null;
 
-  // ── DOM refs ───────────────────────────────────────────────────────────────
-  const dropZone      = document.getElementById('drop-zone');
-  const fileInput     = document.getElementById('file-input');
-  const fileInfo      = document.getElementById('file-info');
-  const fileNameEl    = document.getElementById('file-name-display');
-  const fileSizeEl    = document.getElementById('file-size-display');
-  const removeBtn     = document.getElementById('remove-btn');
-  const chunkSizeEl   = document.getElementById('chunk-size');
-  const processBtn    = document.getElementById('process-btn');
-  const errorMsg      = document.getElementById('error-msg');
-  const progressArea  = document.getElementById('progress-area');
-  const progressText  = document.getElementById('progress-text');
-  const progressPct   = document.getElementById('progress-pct');
-  const progressFill  = document.getElementById('progress-fill');
-  const progressStatus= document.getElementById('progress-status');
-  const resultsArea   = document.getElementById('results-area');
-  const resultsMeta   = document.getElementById('results-meta');
-  const chunkList     = document.getElementById('chunk-list');
-  const downloadBtn   = document.getElementById('download-btn');
+  const dropZone       = document.getElementById('drop-zone');
+  const fileInput      = document.getElementById('file-input');
+  const fileInfo       = document.getElementById('file-info');
+  const fileNameEl     = document.getElementById('file-name-display');
+  const fileSizeEl     = document.getElementById('file-size-display');
+  const removeBtn      = document.getElementById('remove-btn');
+  const chunkSizeEl    = document.getElementById('chunk-size');
+  const processBtn     = document.getElementById('process-btn');
+  const errorMsg       = document.getElementById('error-msg');
+  const progressArea   = document.getElementById('progress-area');
+  const progressText   = document.getElementById('progress-text');
+  const progressPct    = document.getElementById('progress-pct');
+  const progressFill   = document.getElementById('progress-fill');
+  const progressStatus = document.getElementById('progress-status');
+  const resultsArea    = document.getElementById('results-area');
+  const resultsMeta    = document.getElementById('results-meta');
+  const chunkList      = document.getElementById('chunk-list');
+  const downloadBtn    = document.getElementById('download-btn');
 
-  // ── Helpers ────────────────────────────────────────────────────────────────
   function fmtBytes(b) {
     if (b < 1024) return b + ' B';
     if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
     return (b / 1048576).toFixed(1) + ' MB';
   }
-
-  function showError(msg) {
-    errorMsg.textContent = msg;
-    errorMsg.classList.add('visible');
-  }
-
-  function clearError() {
-    errorMsg.textContent = '';
-    errorMsg.classList.remove('visible');
-  }
-
+  function showError(msg) { errorMsg.textContent = msg; errorMsg.classList.add('visible'); }
+  function clearError()   { errorMsg.textContent = ''; errorMsg.classList.remove('visible'); }
   function setProgress(pct, label, status) {
     progressFill.style.width = pct + '%';
     progressPct.textContent  = Math.round(pct) + '%';
-    if (label)  progressText.textContent   = label;
+    if (label)            progressText.textContent   = label;
     if (status !== undefined) progressStatus.textContent = status;
   }
 
   // ── File selection ─────────────────────────────────────────────────────────
   function setFile(file) {
-    if (!file || file.type !== 'application/pdf') {
-      showError('Please select a valid PDF file.');
-      return;
-    }
+    if (!file || file.type !== 'application/pdf') { showError('Please select a valid PDF file.'); return; }
     clearError();
     selectedFile = file;
     fileNameEl.textContent = file.name;
     fileSizeEl.textContent = fmtBytes(file.size);
     fileInfo.classList.add('visible');
     processBtn.disabled = false;
-    // Reset any previous results
     resultsArea.classList.remove('visible');
     progressArea.classList.remove('visible');
     generatedBlob = null;
   }
-
-  fileInput.addEventListener('change', e => {
-    if (e.target.files[0]) setFile(e.target.files[0]);
-  });
-
+  fileInput.addEventListener('change', e => { if (e.target.files[0]) setFile(e.target.files[0]); });
   removeBtn.addEventListener('click', () => {
-    selectedFile = null;
-    fileInput.value = '';
-    fileInfo.classList.remove('visible');
-    processBtn.disabled = true;
-    clearError();
-    resultsArea.classList.remove('visible');
-    progressArea.classList.remove('visible');
+    selectedFile = null; fileInput.value = '';
+    fileInfo.classList.remove('visible'); processBtn.disabled = true;
+    clearError(); resultsArea.classList.remove('visible'); progressArea.classList.remove('visible');
   });
-
-  // Drag & drop
-  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
-  dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+  dropZone.addEventListener('dragover',  e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+  dropZone.addEventListener('dragleave', ()  => dropZone.classList.remove('drag-over'));
   dropZone.addEventListener('drop', e => {
-    e.preventDefault();
-    dropZone.classList.remove('drag-over');
-    const f = e.dataTransfer.files[0];
-    if (f) { fileInput.value = ''; setFile(f); }
+    e.preventDefault(); dropZone.classList.remove('drag-over');
+    const f = e.dataTransfer.files[0]; if (f) { fileInput.value = ''; setFile(f); }
   });
 
-  // ── Core processing ────────────────────────────────────────────────────────
-  processBtn.addEventListener('click', async () => {
-    if (!selectedFile) return;
-    clearError();
-    processBtn.disabled = true;
-    resultsArea.classList.remove('visible');
-    progressArea.classList.add('visible');
-    setProgress(0, 'Loading PDF…', '');
+  // ══════════════════════════════════════════════════════════════════════════
+  // IMPROVEMENT 5 — Coordinate-based text reconstruction
+  // ══════════════════════════════════════════════════════════════════════════
+  function reconstructPageText(items, pageHeight) {
+    const mapped = items
+      .filter(it => it.str && it.str.trim())
+      .map(it => ({
+        str:      it.str,
+        x:        it.transform[4],
+        y:        pageHeight - it.transform[5],   // flip to top-down
+        w:        it.width || 0,
+        fontSize: Math.abs(it.transform[3]) || Math.abs(it.transform[0]) || 10,
+      }));
 
-    try {
-      const chunkSize = Math.max(1, parseInt(chunkSizeEl.value, 10) || 25);
+    if (!mapped.length) return '';
 
-      // 1. Read file as ArrayBuffer
-      const arrayBuffer = await selectedFile.arrayBuffer();
-
-      // 2. Load with PDF.js
-      setProgress(2, 'Parsing PDF…', 'Initialising PDF.js…');
-      const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-      const totalPages = pdf.numPages;
-
-      // 3. Extract text page by page
-      const pageTexts = [];
-      for (let i = 1; i <= totalPages; i++) {
-        const page    = await pdf.getPage(i);
-        const content = await page.getTextContent();
-        const text    = content.items.map(item => item.str).join(' ');
-        pageTexts.push(text);
-        const pct = 5 + ((i / totalPages) * 65);
-        setProgress(pct, `Extracting text… (page ${i} of ${totalPages})`, '');
+    // Sort top→bottom, left→right then group into lines
+    mapped.sort((a, b) => a.y - b.y || a.x - b.x);
+    const groups = [];
+    for (const item of mapped) {
+      const tol  = Math.max(item.fontSize * 0.45, 2);
+      const last = groups[groups.length - 1];
+      if (last && Math.abs(item.y - last.y) <= tol) {
+        last.items.push(item);
+      } else {
+        groups.push({ y: item.y, items: [item] });
       }
-
-      // 4. Build chunks
-      setProgress(72, 'Splitting into chunks…', '');
-      const chunks = [];
-      for (let start = 0; start < totalPages; start += chunkSize) {
-        const end   = Math.min(start + chunkSize - 1, totalPages - 1);
-        const text  = pageTexts.slice(start, end + 1).join('\n\n');
-        chunks.push({ startPage: start + 1, endPage: end + 1, text });
-      }
-
-      // 5. Build .docx
-      setProgress(78, 'Building .docx file…', `${chunks.length} chunk(s) to assemble`);
-      const blob = await buildDocx(chunks, selectedFile.name);
-      generatedBlob = blob;
-
-      setProgress(100, 'Done!', '');
-
-      // 6. Render results
-      renderResults(chunks, totalPages, chunkSize);
-
-    } catch (err) {
-      console.error(err);
-      showError('Error processing PDF: ' + (err.message || err));
-      progressArea.classList.remove('visible');
-      processBtn.disabled = false;
     }
-  });
 
-  // ── Build .docx (raw Open XML + JSZip) ────────────────────────────────────
-  function escXml(s) {
-    return String(s)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, ''); // strip illegal XML chars
+    // Build each line string using gap-aware joining
+    const rawLines = groups.map(g => {
+      g.items.sort((a, b) => a.x - b.x);
+      let text = '';
+      for (let i = 0; i < g.items.length; i++) {
+        const it   = g.items[i];
+        if (i === 0) { text = it.str; continue; }
+        const prev  = g.items[i - 1];
+        const gap   = it.x - (prev.x + prev.w);
+        const charW = (prev.w > 0 && prev.str.length > 0)
+          ? prev.w / prev.str.length
+          : prev.fontSize * 0.5;
+        text += (gap < charW * 0.3) ? it.str : ' ' + it.str;
+      }
+      return text.trim();
+    }).filter(Boolean);
+
+    // Merge hyphenated line-end breaks
+    const lines = [];
+    for (let i = 0; i < rawLines.length; i++) {
+      if (rawLines[i].endsWith('-') && i + 1 < rawLines.length) {
+        lines.push(rawLines[i].slice(0, -1) + rawLines[i + 1]);
+        i++;
+      } else {
+        lines.push(rawLines[i]);
+      }
+    }
+    return lines.join('\n');
   }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // IMPROVEMENT 1 — Header / footer detection and removal
+  // ══════════════════════════════════════════════════════════════════════════
+  function normHF(s) {
+    return s.replace(/\b\d+\b/g, '#').replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  function buildHFFilter(pageTexts) {
+    const n = pageTexts.length;
+    const firstFreq = new Map();
+    const lastFreq  = new Map();
+
+    for (const t of pageTexts) {
+      const lines = t.split('\n').map(l => l.trim()).filter(Boolean);
+      if (!lines.length) continue;
+      const kf = normHF(lines[0]);
+      if (kf.length > 4) firstFreq.set(kf, (firstFreq.get(kf) || 0) + 1);
+      const kl = normHF(lines[lines.length - 1]);
+      if (kl.length > 4) lastFreq.set(kl, (lastFreq.get(kl) || 0) + 1);
+    }
+
+    const thr    = Math.max(3, Math.floor(n * 0.25));
+    const rFirst = new Set([...firstFreq].filter(([, v]) => v >= thr).map(([k]) => k));
+    const rLast  = new Set([...lastFreq ].filter(([, v]) => v >= thr).map(([k]) => k));
+
+    if (!rFirst.size && !rLast.size) return t => t;
+
+    return t => {
+      const lines = t.split('\n');
+      const ne = [];   // indices of non-empty lines
+      lines.forEach((l, i) => { if (l.trim()) ne.push(i); });
+      if (!ne.length) return t;
+
+      let s = 0, e = lines.length;
+      if (rFirst.has(normHF(lines[ne[0]])))                 s = ne[0] + 1;
+      if (rLast.has(normHF(lines[ne[ne.length - 1]])))      e = ne[ne.length - 1];
+
+      const result = lines.slice(s, e).join('\n');
+      // Safety: don't strip if we removed > 70 % of content
+      return result.trim().length >= t.trim().length * 0.3 ? result : t;
+    };
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // IMPROVEMENT 2 — Text post-processor
+  // ══════════════════════════════════════════════════════════════════════════
+  function cleanText(t) {
+    return t
+      // "C h a p t e r" → "Chapter"  (run of spaced single chars)
+      .replace(/\b([A-Za-z] ){2,}[A-Za-z]\b/g, m => m.replace(/ /g, ''))
+      // space before punctuation
+      .replace(/ ([.,;:!?)\]}])/g, '$1')
+      // space after opening bracket
+      .replace(/([(\[{]) /g, '$1')
+      // multiple spaces / tabs → one space
+      .replace(/[ \t]{2,}/g, ' ')
+      // 3+ newlines → 2
+      .replace(/\n{3,}/g, '\n\n')
+      // trim each line
+      .split('\n').map(l => l.trim()).join('\n')
+      .trim();
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // IMPROVEMENT 3 — Smart chunk boundaries
+  // ══════════════════════════════════════════════════════════════════════════
+  const HEADING_RE = /^(chapter|appendix|section|part|exhibit|schedule|annex|\d+[.\s])/i;
+  const ALLCAPS_RE = /^[A-Z][A-Z0-9 ,.\-:]{7,}$/;
+
+  function breakScore(pageText) {
+    const first = (pageText.split('\n')[0] || '').trim();
+    if (!first || pageText.trim().length < 30) return 3;  // blank / near-blank
+    if (HEADING_RE.test(first)) return 2;
+    if (ALLCAPS_RE.test(first)) return 1;
+    return 0;
+  }
+
+  function smartBoundaries(pageTexts, totalPages, chunkSize) {
+    const WINDOW = Math.max(2, Math.min(5, Math.floor(chunkSize * 0.15)));
+    const starts = [0];
+    let pos = chunkSize;
+    while (pos < totalPages) {
+      const lo = Math.max(pos - WINDOW, starts[starts.length - 1] + 1);
+      const hi = Math.min(pos + WINDOW, totalPages - 1);
+      let best = Math.min(pos, totalPages - 1), bestS = -Infinity;
+      for (let i = lo; i <= hi; i++) {
+        const s = breakScore(pageTexts[i]) - Math.abs(i - pos) * 0.15;
+        if (s > bestS) { bestS = s; best = i; }
+      }
+      starts.push(best);
+      pos = best + chunkSize;
+    }
+    return starts;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // XML helper
+  // ══════════════════════════════════════════════════════════════════════════
+  function escXml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // DOCX builder — includes IMPROVEMENT 4 (front-matter index / TOC)
+  // ══════════════════════════════════════════════════════════════════════════
   async function buildDocx(chunks, originalName) {
     const zip = new JSZip();
 
@@ -671,55 +740,85 @@
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:style w:type="paragraph" w:default="1" w:styleId="Normal">
     <w:name w:val="Normal"/>
-    <w:rPr><w:sz w:val="24"/><w:szCs w:val="24"/></w:rPr>
+    <w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Heading1">
     <w:name w:val="heading 1"/>
     <w:basedOn w:val="Normal"/>
-    <w:pPr><w:spacing w:before="480" w:after="120"/></w:pPr>
-    <w:rPr>
-      <w:b/><w:sz w:val="40"/><w:szCs w:val="40"/>
-      <w:color w:val="6C63FF"/>
-    </w:rPr>
+    <w:pPr><w:spacing w:before="480" w:after="160"/></w:pPr>
+    <w:rPr><w:b/><w:sz w:val="40"/><w:szCs w:val="40"/><w:color w:val="6C63FF"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="DocTitle">
+    <w:name w:val="Doc Title"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:jc w:val="center"/><w:spacing w:before="720" w:after="240"/></w:pPr>
+    <w:rPr><w:b/><w:sz w:val="56"/><w:szCs w:val="56"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="TOCEntry">
+    <w:name w:val="TOC Entry"/>
+    <w:basedOn w:val="Normal"/>
+    <w:pPr><w:ind w:left="360"/><w:spacing w:before="60" w:after="60"/></w:pPr>
+    <w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr>
   </w:style>
 </w:styles>`);
 
-    let bodyXml = '';
+    // ── TOC page ──────────────────────────────────────────────────────────
+    let body = '';
+    body += `<w:p><w:pPr><w:pStyle w:val="DocTitle"/></w:pPr>
+      <w:r><w:t>Contents</w:t></w:r></w:p>`;
+    body += `<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:after="80"/></w:pPr>
+      <w:r><w:rPr><w:i/><w:color w:val="888888"/><w:sz w:val="20"/></w:rPr>
+      <w:t>${escXml(originalName)}</w:t></w:r></w:p>`;
+    body += `<w:p><w:pPr><w:spacing w:after="320"/></w:pPr></w:p>`;
+
+    chunks.forEach((chunk, idx) => {
+      const label = chunk.startPage === chunk.endPage
+        ? `Page ${chunk.startPage}`
+        : `Pages ${chunk.startPage}\u2013${chunk.endPage}`;
+      const wc = chunk.text.trim().split(/\s+/).filter(Boolean).length;
+      body += `<w:p><w:pPr><w:pStyle w:val="TOCEntry"/></w:pPr>
+        <w:r><w:rPr><w:b/><w:color w:val="6C63FF"/></w:rPr>
+          <w:t xml:space="preserve">Part ${idx + 1}</w:t></w:r>
+        <w:r><w:rPr><w:color w:val="555555"/></w:rPr>
+          <w:t xml:space="preserve">  \u2014  ${escXml(label)}  \u00b7  ${wc.toLocaleString()} words</w:t></w:r>
+      </w:p>`;
+    });
+
+    body += `<w:p><w:r><w:br w:type="page"/></w:r></w:p>`;
+
+    // ── Content chunks ────────────────────────────────────────────────────
     chunks.forEach((chunk, idx) => {
       const label = chunk.startPage === chunk.endPage
         ? `Page ${chunk.startPage}`
         : `Pages ${chunk.startPage}\u2013${chunk.endPage}`;
 
-      if (idx > 0) {
-        bodyXml += `<w:p><w:r><w:br w:type="page"/></w:r></w:p>`;
-      }
+      if (idx > 0) body += `<w:p><w:r><w:br w:type="page"/></w:r></w:p>`;
 
-      bodyXml += `<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>${escXml(label)}</w:t></w:r></w:p>`;
+      body += `<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+        <w:r><w:t>${escXml(`Part ${idx + 1} \u2014 ${label}`)}</w:t></w:r></w:p>`;
+      body += `<w:p><w:pPr><w:spacing w:after="240"/></w:pPr>
+        <w:r><w:rPr><w:i/><w:color w:val="888888"/><w:sz w:val="20"/></w:rPr>
+        <w:t>${escXml('Source: ' + originalName + '  |  ' + label)}</w:t></w:r></w:p>`;
 
-      bodyXml += `<w:p><w:pPr><w:spacing w:after="240"/></w:pPr><w:r>
-        <w:rPr><w:i/><w:color w:val="888888"/><w:sz w:val="20"/></w:rPr>
-        <w:t>${escXml('Source: ' + originalName + '  |  ' + label)}</w:t>
-      </w:r></w:p>`;
-
-      const paragraphs = chunk.text
+      const paras = chunk.text
         .split(/\n{2,}/)
-        .map(p => p.replace(/\s+/g, ' ').trim())
-        .filter(p => p.length > 0);
+        .map(p => p.replace(/\n/g, ' ').replace(/\s+/g, ' ').trim())
+        .filter(Boolean);
 
-      if (paragraphs.length === 0) {
-        bodyXml += `<w:p><w:r><w:rPr><w:i/><w:color w:val="999999"/></w:rPr>
+      if (!paras.length) {
+        body += `<w:p><w:r><w:rPr><w:i/><w:color w:val="999999"/></w:rPr>
           <w:t>[No text extracted for this page range]</w:t></w:r></w:p>`;
       } else {
-        paragraphs.forEach(para => {
-          bodyXml += `<w:p><w:pPr><w:spacing w:after="160"/></w:pPr>
+        for (const para of paras) {
+          body += `<w:p><w:pPr><w:spacing w:after="120"/></w:pPr>
             <w:r><w:t xml:space="preserve">${escXml(para)}</w:t></w:r></w:p>`;
-        });
+        }
       }
     });
 
     zip.file('word/document.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-  <w:body>${bodyXml}<w:sectPr/></w:body>
+  <w:body>${body}<w:sectPr/></w:body>
 </w:document>`);
 
     return zip.generateAsync({
@@ -728,31 +827,90 @@
     });
   }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // Main pipeline
+  // ══════════════════════════════════════════════════════════════════════════
+  processBtn.addEventListener('click', async () => {
+    if (!selectedFile) return;
+    clearError();
+    processBtn.disabled = true;
+    resultsArea.classList.remove('visible');
+    progressArea.classList.add('visible');
+    setProgress(0, 'Loading PDF…', '');
+
+    try {
+      const chunkSize   = Math.max(1, parseInt(chunkSizeEl.value, 10) || 25);
+      const arrayBuffer = await selectedFile.arrayBuffer();
+
+      setProgress(2, 'Parsing PDF…', '');
+      const pdf        = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+      const totalPages = pdf.numPages;
+
+      // 1. Extract raw items per page
+      const rawPages = [];
+      for (let i = 1; i <= totalPages; i++) {
+        const page    = await pdf.getPage(i);
+        const vp      = page.getViewport({ scale: 1.0 });
+        const content = await page.getTextContent();
+        rawPages.push({ items: content.items, height: vp.height });
+        setProgress(5 + (i / totalPages) * 50, `Extracting text… (${i} / ${totalPages})`, '');
+      }
+
+      // 2. Coordinate-based reconstruction
+      setProgress(58, 'Reconstructing lines…', '');
+      const rawTexts = rawPages.map(p => reconstructPageText(p.items, p.height));
+
+      // 3. Detect & strip headers / footers, then clean
+      setProgress(63, 'Removing headers & footers…', '');
+      const hfFilter  = buildHFFilter(rawTexts);
+      const pageTexts = rawTexts.map(t => cleanText(hfFilter(t)));
+
+      // 4. Smart chunk boundaries
+      setProgress(70, 'Finding natural break points…', '');
+      const boundaries = smartBoundaries(pageTexts, totalPages, chunkSize);
+      const chunks = boundaries.map((start, idx) => {
+        const end  = (boundaries[idx + 1] || totalPages) - 1;
+        const text = pageTexts.slice(start, end + 1).join('\n\n');
+        return { startPage: start + 1, endPage: end + 1, text };
+      });
+
+      // 5. Build .docx
+      setProgress(78, 'Building .docx…', `${chunks.length} chunk(s)`);
+      generatedBlob = await buildDocx(chunks, selectedFile.name);
+
+      setProgress(100, 'Done!', '');
+      renderResults(chunks, totalPages, chunkSize);
+
+    } catch (err) {
+      console.error(err);
+      showError('Error processing PDF: ' + (err.message || err));
+      progressArea.classList.remove('visible');
+      processBtn.disabled = false;
+    }
+  });
+
   // ── Render results ─────────────────────────────────────────────────────────
   function renderResults(chunks, totalPages, chunkSize) {
     resultsMeta.textContent =
-      `${chunks.length} chunk${chunks.length !== 1 ? 's' : ''} · ${totalPages} total page${totalPages !== 1 ? 's' : ''} · ~${chunkSize} pages each`;
-
+      `${chunks.length} chunk${chunks.length !== 1 ? 's' : ''} · ${totalPages} total pages · ~${chunkSize} pages each`;
     chunkList.innerHTML = '';
     chunks.forEach((chunk, idx) => {
       const label = chunk.startPage === chunk.endPage
         ? `Page ${chunk.startPage}`
-        : `Pages ${chunk.startPage}–${chunk.endPage}`;
-      const wordCount = chunk.text.trim().split(/\s+/).filter(Boolean).length;
-      const preview   = chunk.text.replace(/\s+/g, ' ').trim().slice(0, 120);
-
-      const item = document.createElement('div');
+        : `Pages ${chunk.startPage}\u2013${chunk.endPage}`;
+      const wc      = chunk.text.trim().split(/\s+/).filter(Boolean).length;
+      const preview = chunk.text.replace(/\s+/g, ' ').trim().slice(0, 120);
+      const item    = document.createElement('div');
       item.className = 'chunk-item';
       item.innerHTML = `
         <div class="chunk-badge">Chunk ${idx + 1}</div>
         <div class="chunk-body">
           <div class="chunk-range">${label}</div>
-          <div class="chunk-stats">${wordCount.toLocaleString()} words extracted</div>
+          <div class="chunk-stats">${wc.toLocaleString()} words</div>
           ${preview ? `<div class="chunk-preview">${escHtml(preview)}${chunk.text.length > 120 ? '…' : ''}</div>` : ''}
         </div>`;
       chunkList.appendChild(item);
     });
-
     resultsArea.classList.add('visible');
     processBtn.disabled = false;
   }
@@ -761,19 +919,14 @@
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
-  // ── Download button ────────────────────────────────────────────────────────
+  // ── Download ───────────────────────────────────────────────────────────────
   downloadBtn.addEventListener('click', () => {
     if (!generatedBlob) return;
-    const baseName = selectedFile
-      ? selectedFile.name.replace(/\.pdf$/i, '')
-      : 'document';
-    const url = URL.createObjectURL(generatedBlob);
-    const a   = document.createElement('a');
-    a.href     = url;
-    a.download = `${baseName}-chunked.docx`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    const base = selectedFile ? selectedFile.name.replace(/\.pdf$/i, '') : 'document';
+    const url  = URL.createObjectURL(generatedBlob);
+    const a    = document.createElement('a');
+    a.href = url; a.download = `${base}-chunked.docx`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 10000);
   });
 
